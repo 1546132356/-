@@ -1,0 +1,453 @@
+#include<reg51.h>
+typedef unsigned char u8;
+typedef unsigned int u16;
+typedef unsigned  long u32;
+xdata u8 row _at_ 0x8001;     //键盘的行
+xdata u8 cow _at_ 0x8002;    //位选,?
+xdata u8 led _at_ 0x8004;     //段码
+xdata u8 DA _at_ 0x9000;    //DA
+void start();				//电机启动函数
+void time();				//定时器中断函数
+void display();				//LED数码管显示函数
+u8 key,dangsu=0,moshi=0,i,speed=128;
+u8 second=0;   // 默认定时时间
+u8 mintue=0;
+u8 m=20;           
+u8 flog;      //用于存放输入数据
+u8 biaoji=0;  //标记是否有信号到来
+u8 ir_time;    //高电平时长
+u8 ir_value[4];   //存放红外接受到的数据
+bit st=0;             //定时启动标志
+bit stop=0;         //定时结束标志
+bit ir_recved =0;                  //标记红外接受到的数据是否正确                   
+sbit IRIN=P3^2;                       //用于红外部分的控制
+bit sta=0;   //电机启动标志
+u8 dispbuf[6]={0,0,0,0,0,0};  //保存分，秒分别除十取整和取余的结果
+u8 code tab[16] = {0x3f, 0x06, 0x5b, 0x4f, 0x66, 0x6d, 0x7d, 0x07, 0x7f, 0x6f, 0x77, 0x7c, 0x39, 0x5e, 0x79, 0x71};
+code u8 keytable[] = {       // 键码定义,坐标=列x4+行
+  0x16, 0x15, 0x14, 0xff,  
+  0x13, 0x12, 0x11, 0x10,
+  0x0d, 0x0c, 0x0b, 0x0a,
+  0x0e, 0x03, 0x06, 0x09,
+  0x0f, 0x02, 0x05, 0x08,
+  0x00, 0x01, 0x04, 0x07
+};
+
+
+
+ void delay_lus(u16  i) //延迟程序，用于红外部分
+{ 
+       while (i--) ;
+
+ }
+  void init1 () interrupt 0    //红外接受信号，使用外部中断0
+ {
+          //引导码: 9ms 0,4.5ms 1
+          //数据0:0.56ms 0,0.56ms 1
+          //数据1:0.56ms 0,1.7ms  1
+          //接收格式为:1个起始码，4位用户码，4位用户反码，4位数据码，4位数据反码
+        unsigned char j, k;
+        unsigned int err;
+        ir_time = 0;    //高电平时长初始化
+        delay_lus(700);   //收到红外信号后等待7ms
+        if (IRIN != 0)  //若还为0则代表起始码,若不是起始码则结束
+            return;
+        err = 1000;  //1000 * 10us = 10ms
+        while ((IRIN == 0) && (err > 0))   //等起始码的9ms 低电平结束 
+        {
+               delay_lus(1);   // 10 us
+               err--;
+	 }
+         if (IRIN != 1)       // 如果超时后依旧没低电平，退出
+              return;
+         err=500;           // 500* 10us = 5ms
+        while ((IRIN== 1)&& (err > 0))//等待4.5ms的高电平
+	{     
+	       delay_lus(1);
+               err--;
+         }
+         for (k =0; k <4; k++)
+	 {      //接收4组4位数据
+             for (j=0; j<8; j++)   //一组4位的数据
+             {  
+		   ir_time=0;         //计算高电平时长
+                   err = 60;          // 60* 10=0.6ms
+                   while ((IRIN==0) &&(err > 0))       //等待560us 低电平
+		    { 
+		        delay_lus(1);
+                        err--;
+                    }
+                    while (IRIN== 1)     //计算高电平时常
+                     {
+			delay_lus(10);     //0.1ms
+			ir_time++;
+                        err--;
+                        if (ir_time> 30)      //0.1ms * 30= 3ms，超时
+                             return;
+                     }
+		      ir_value[k]>>= 1;
+                      if(ir_time >=8)    //如果高电平出现大于800us，是1
+                     {
+                            ir_value[k] |=0x80;    //从左往右移动，最高位为1
+                     }
+		  }
+	     }
+          if(ir_value[2] !=~ir_value[3])//校验数据是否正确
+             return;
+          else ir_recved = 1; 
+         switch(ir_value[2]) 
+         { 
+           case 0x16:flog=0;break; 
+           case 0x0c:flog=1;break; 
+           case 0x18:flog=2;break; 
+           case 0x5e:flog=3;break; 
+           case 0x08:flog=4;break; 
+           case 0x1c:flog=5;break; 
+           case 0x5a:flog=6;break; 
+           case 0x42:flog=7;break;
+	   case 0x52:flog=8;break;
+	   case 0x4a:flog=9;break;
+	   case 0x19:flog=10;break;
+           default:flog=-1;break; 
+         }
+       biaoji=1; 
+}
+
+
+
+void delay(u16 x)     //延时 消除抖动
+{  
+    u16 i;
+		u8 j;
+    for (i = x; i > 0; i--)
+        for (j = 110; j > 0; j--)    ;
+}
+
+u8 TestKey()             //按键是否摁下
+{
+   cow= 0;            // 输出线置为0
+   return (~row & 0x0f);   // 读入键状态 (高四位不用)
+}
+
+u8 keyScan()       //获取键值
+{        u8 h,l;
+		cow=0x00;    //列全为低电平
+		if(row!=0x0f)   //有行变为低电平有键按下
+		{
+				delay(10);    //延时 消除抖动
+				cow=0x00;	//判断是哪一行
+				if(row==0x07) h=3;          
+				else if(row==0x0b) h=2;  //row3
+				else if(row==0x0d) h=1; //row2
+				else  h=0;	//row1
+	
+				//判断哪一列
+				cow=0x1f;				//cow1
+				if(row!=0x0f) l=5;
+				delay(1);
+				
+				cow=0x2f;				//cow2
+				if(row!=0x0f)	l=4;
+				delay(1);
+
+				cow=0x37;				//cow3
+				if(row!=0x0f)	l=3;
+				delay(1);
+			
+				cow=0x3b;				//cow4
+				if(row!=0x0f)	l=2;
+				delay(1);
+				
+				cow=0x3d;				//cow5
+				if(row!=0x0f)	l=1;
+				delay(1);
+				
+				cow=0x3e;				//cow6
+				if(row!=0x0f)  l=0;
+				delay(1);
+				cow=0x00;
+				delay(1);
+				while(row!=0x0f) delay(10);
+				 key=l*4+h;
+				while(row!=0x0f) delay(10);
+				      if(key>=10&&key<=11&&sta) dispbuf[4]=keytable[key];
+				return key;   //返回键值 0xmn  m为行 n为列
+		}
+		return 0x00;
+}
+
+
+void start()
+{      
+        stop=0;
+         sta=1;
+       if(moshi==1||moshi==0)
+         speed=0XBB;    //3v
+       else speed=60;
+         DA=speed;
+        dangsu=1;
+}
+void close(){
+    stop=0;
+    sta=0;
+	st=0;
+	moshi=0;
+	dangsu=0;
+    DA=0x80;
+    for(i=0;i<6;i++)     //计时器清零
+		dispbuf[i]=0;
+		second=0;
+		mintue=0;
+ 		ET0=0;                   
+ 		TR0=0;  		  //定时器停止计时
+ }
+ void dcct(){
+   			
+	    if(stop)   close();
+	    if(flog>=4&&flog<=5&&sta) dispbuf[4]=moshi+9;
+	    else if(sta)
+		{ if(moshi==0) {
+		      moshi=1;
+		      dispbuf[4]=moshi+9;
+		     }
+		  else dispbuf[4]=moshi+9;
+		 }
+}
+void DC1()
+ {      stop=0;
+             sta=1;
+        if(moshi==1||moshi==0)
+        speed=0x0D5;
+	else speed=128-84;
+	   DA=speed;
+        dangsu=2;
+}
+void DC2(){
+       stop=0;
+       sta=1;
+     if(moshi==1||moshi==0)
+      speed=0x0ff;
+     else speed=0;
+	DA=speed;
+       dangsu=3;
+}
+void fan()
+{
+   if(sta){
+   if(speed>128)
+      speed=~speed;
+   DA=speed;
+   moshi=2;
+   }
+}
+void zh()
+{   
+    if(sta){
+    moshi=1;
+    if(speed<128)
+     speed=~speed;
+    DA=speed;
+    }
+}
+void ts()
+{     if(!sta) return;
+        if(!(second||mintue))
+	 second=10;
+	dispbuf[3]=second%10;
+	dispbuf[2]=second/10;
+	dispbuf[1]=mintue%10;	
+	dispbuf[0]=mintue%11;
+        st=1;
+	display();
+        TMOD=0x01;                            
+ 	TH0=0x3c; 		//定时器高八位初值               
+ 	TL0=0x0b0;		//定时器低八位初值           
+ 	EA=1;			//允许CPU开启中断                    
+ 	ET0=1;  		//允许定时器中断                 
+ 	TR0=1;          //开启定时器
+} 
+void te()
+{
+      	ET0=0;                   
+        TR0=0;  		  //定时器停止计时
+}
+void res()
+{
+       ET0=0;
+	   TR0=0;
+	   st=0;
+	   second=0;
+	   mintue=0;
+	for(i=0;i<4;i++)	dispbuf[i]=0;
+}
+
+
+
+
+
+void  time () interrupt 1  //定时器0中断
+{
+	TH0=0x3c;
+	TL0=0x0b0;
+	m-=1;
+	if(m!=0)
+		return;
+	else
+	{
+		m=20;
+		if(second==1)
+		{  if(mintue==0)
+		  {	   
+		      DA=0x80;
+		      stop=1;
+			  return;
+	          }
+
+		   
+		else{
+		      second=59;
+		      mintue--;
+		   }
+		  }
+		   else 
+		     second--;
+	  }
+		dispbuf[3]=second%10;
+		dispbuf[2]=second/10;
+		dispbuf[1]=mintue%10;
+		dispbuf[0]=mintue/10;
+		
+}
+
+void display()   //数码管显示
+{
+  u8 i;
+  u8 Pos;
+  u8 LED;
+  Pos = 0x20;  
+   
+ 	if(sta)
+	{ 
+	    if(dangsu<3) P1=moshi*16+2*dangsu;
+	       else P1=moshi*16+8;
+	   if(st) P1|=0x80;
+	  else P1&=0x7F;
+	  if(st&&!TR0) P1|=0x40;
+	  else  P1&=0x0BF;
+	 }
+	else P1=!sta;
+	   
+        if(sta) 
+	{
+	   dispbuf[5]=dangsu;
+         }
+	 
+  for (i = 0; i <6; i++) {
+    cow= 0;     // 关所有管
+    LED =tab[dispbuf[i]]; 	
+    led= LED;
+    cow= Pos;   // 显示一个数码管
+    delay(5);
+    Pos >>= 1;      // 下一个
+  }
+}
+
+
+
+void main()										  
+{     
+       EA=1;    //中断允许总控制位 
+       EX0=1;  //外部中断 0 允许位（红外） 
+       IT0=1;   //跳沿触发
+       DA=0x80;
+	while(1)
+	{   
+		 if(biaoji){
+		        if(flog==1)           start(); //摁1，1档
+			else if(flog==0) close();//摁0，关闭
+			else if(flog==2)   DC1();//摁2，二档
+			else if(flog==3)   DC2();//摁3，三档
+			else if(flog==4)   zh();  //摁4，反转
+			else if(flog==5)   fan();    //摁5 正转
+		        else if(flog==6)    ts();  //摁6，定时开始
+			else if(flog==7)    te();  //摁7，暂停定时
+			else if(flog==10)	res(); //摁rpt 退出定时
+			else if(flog==8&&st==1)   //摁8，分+  
+			{      
+			      if(mintue==59)
+				     mintue=0;
+			      else mintue++;
+			      dispbuf[3]=second%10;
+		              dispbuf[2]=second/10;
+		              dispbuf[1]=mintue%10;
+		              dispbuf[0]=mintue/10;
+			}
+			else if(flog==9&&st==1)  //摁9，秒+
+			  { 
+			     if(second>=50)
+		             {
+			         second=second+10-60;
+			        if(mintue==59)
+				     mintue=0;
+			         else
+				   mintue+=1;
+		               }
+		             else     
+			     second+=10;
+		              dispbuf[3]=second%10;
+		              dispbuf[2]=second/10;
+		              dispbuf[1]=mintue%10;
+		              dispbuf[0]=mintue/10;
+		          }
+			  dispbuf[5]=dangsu;
+			  biaoji=0;
+			}
+			if (TestKey())
+	           {
+	            key=keyScan();
+			if(key==21)           start(); //摁1，1档
+			else if(key==20) close();//摁0，关闭
+			else if(key==17)   DC1();//摁2，二档
+			else if(key==13)   DC2();//摁3，三档
+			else if(key==22)   zh();  //摁4正转
+			else if(key==18)   fan(); //摁5 反转
+		        else if(key==14)    ts();        //摁6，定时开始
+			else if(key==23)    te();        //摁7,????
+			else if(key==3)    res();     //?res,???????
+			else if(key==19&&st==1)   //8 分+  
+			{      
+			      if(mintue==59)
+				     mintue=0;
+			      else mintue++;
+			      dispbuf[3]=second%10;
+		              dispbuf[2]=second/10;
+		              dispbuf[1]=mintue%10;
+		              dispbuf[0]=mintue/10;
+			  }
+			else if(key==15&&st==1)  //9 秒+   
+			  { 
+			     if(second==50)
+		             {
+			         second=0;
+			        if(mintue==59)
+				     mintue=0;
+			         else
+				   mintue+=1;
+		               }
+		             else     
+			     second+=10;
+		              dispbuf[3]=second%10;
+		              dispbuf[2]=second/10;
+		              dispbuf[1]=mintue%10;
+		              dispbuf[0]=mintue/10;
+		          }
+		
+	            }
+		                
+			         dcct();
+                    	         display();
+	 }
+}
+
+
+
